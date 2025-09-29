@@ -1,0 +1,217 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <title>Optimal Path Finder — Google-like UI</title>
+
+  <!-- Leaflet -->
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.3/dist/leaflet.css"/>
+  <script src="https://unpkg.com/leaflet@1.9.3/dist/leaflet.js"></script>
+
+  <style>
+    html,body { height:100%; margin:0; font-family: Arial, Helvetica, sans-serif; }
+    .container { display:flex; height:100vh; }
+    .left { width:380px; background:#fff; color:#111; box-shadow:2px 0 8px rgba(0,0,0,0.15); z-index:1000; overflow:auto; }
+    .map-wrap { flex:1; position:relative; }
+    .panel-header { background:#fafafa; padding:16px; border-bottom:1px solid #eee; display:flex; align-items:center; gap:12px; }
+    .logo { width:42px; height:42px; background:#00c9a7; border-radius:8px; display:flex; align-items:center; justify-content:center; color:white; font-weight:700; font-size:18px; }
+    .form { padding:14px 18px; }
+    .field { margin-bottom:10px; position:relative; }
+    input[type="text"], select { width:100%; padding:10px; border-radius:6px; border:1px solid #ddd; font-size:14px; }
+    .btn { padding:10px 14px; background:#00c9a7; color:#012; border-radius:6px; cursor:pointer; border:none; font-weight:700; }
+    .results { padding:12px 18px; border-top:1px solid #eee; }
+    #map { position:absolute; inset:0; }
+    .autocomplete-suggestions { position:absolute; top:100%; left:0; right:0; background:white; border:1px solid #ccc; z-index:2000; max-height:160px; overflow-y:auto; }
+    .autocomplete-suggestions div { padding:8px; cursor:pointer; }
+    .autocomplete-suggestions div:hover { background:#f0f0f0; }
+    .route-item { padding:8px; margin:6px 0; border:1px solid #ddd; border-radius:6px; cursor:pointer; }
+    .route-item.optimal { background:#f0f8ff; border-color:#007bff; }
+    .steps-list { max-height: 300px; overflow-y: auto; margin-top: 10px; }
+    .step-item { padding: 6px 10px; border-bottom: 1px solid #ddd; font-size: 13px; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="left">
+      <div class="panel-header">
+        <div class="logo">OP</div>
+        <div><b>OptimalPath — Map Lite</b><br><small style="color:#666">Google-like layout (OSM + ORS)</small></div>
+      </div>
+
+      <div class="form">
+        <div class="field"><label><b>From</b></label>
+          <input id="start" type="text" placeholder="Start location" />
+          <div id="start-suggestions" class="autocomplete-suggestions"></div>
+        </div>
+        <div class="field"><label><b>To</b></label>
+          <input id="end" type="text" placeholder="Destination" />
+          <div id="end-suggestions" class="autocomplete-suggestions"></div>
+        </div>
+        <div class="field"><label><b>Mode</b></label>
+          <select id="mode">
+            <option value="driving-car">🚗 Car</option>
+            <option value="foot-walking">🚶 Walk</option>
+          </select>
+        </div>
+        <div style="display:flex; gap:8px; margin-bottom: 10px;">
+          <button id="findBtn" class="btn">Find Route</button>
+          <button id="locBtn" class="btn" style="background:#eee;color:#111;">Use My Location</button>
+        </div>
+      </div>
+
+      <div class="results">
+        <b>Routes</b>
+        <div id="routesList"></div>
+        <b>Navigation Steps</b>
+        <div id="stepsList" class="steps-list"></div>
+      </div>
+    </div>
+    <div class="map-wrap"><div id="map"></div></div>
+  </div>
+
+<script>
+  // Define base layers
+  const street = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { attribution: '&copy; OpenStreetMap contributors' });
+  const satellite = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', { attribution: 'Tiles © Esri' });
+  const terrain = L.tileLayer('https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png', { attribution: '&copy; OpenTopoMap contributors' });
+
+  const baseLayers = {
+    "Streets": street,
+    "Satellite": satellite,
+    "Terrain": terrain
+  };
+
+  // Initialize map with Streets layer
+  const map = L.map('map', { layers: [street] }).setView([13.0827, 80.2707], 12);
+
+  // Add layer control UI
+  L.control.layers(baseLayers, null, { collapsed: false }).addTo(map);
+
+  let polylines = [], startMarker = null, endMarker = null;
+  let stepMarkers = [];
+
+  // White dot icon for step markers
+  const whiteDotIcon = L.divIcon({
+    className: 'custom-dot',
+    html: '<div style="width:14px;height:14px;background:#fff;border:2px solid #888;border-radius:50%;box-shadow:0 0 4px #0002;"></div>',
+    iconSize: [14, 14],
+    iconAnchor: [7, 7]
+  });
+
+  function clearMap() {
+    polylines.forEach(p => map.removeLayer(p));
+    polylines = [];
+    stepMarkers.forEach(m => map.removeLayer(m));
+    stepMarkers = [];
+
+    if (startMarker) map.removeLayer(startMarker);
+    if (endMarker) map.removeLayer(endMarker);
+  }
+
+  function drawRoutes(data) {
+    clearMap();
+    if (!data || !data.routes) return;
+
+    const colors = ['#0000FF', '#006400'];
+    let allPoints = [];
+
+    startMarker = L.marker([data.start.lat, data.start.lon], { draggable: true }).addTo(map);
+    endMarker = L.marker([data.end.lat, data.end.lon], { draggable: true }).addTo(map);
+
+    startMarker.on("dragend", () => {
+      const pos = startMarker.getLatLng();
+      document.getElementById("start").value = `${pos.lat},${pos.lng}`;
+      document.getElementById("findBtn").click();
+    });
+    endMarker.on("dragend", () => {
+      const pos = endMarker.getLatLng();
+      document.getElementById("end").value = `${pos.lat},${pos.lng}`;
+      document.getElementById("findBtn").click();
+    });
+
+    data.routes.forEach((r, idx) => {
+      const isOptimal = idx === 0;
+      const poly = L.polyline(r.geometry, { color: isOptimal ? colors[0] : colors[1], weight: isOptimal ? 7 : 4, opacity: isOptimal ? 0.95 : 0.6 }).addTo(map);
+      polylines.push(poly);
+      allPoints = allPoints.concat(r.geometry);
+
+      if (isOptimal && r.steps) {
+        r.steps.forEach(step => {
+          const marker = L.marker([step.lat, step.lon], { icon: whiteDotIcon }).addTo(map);
+          marker.bindPopup(`<b>${step.instruction}</b><br>Distance: ${Math.round(step.distance)} m`);
+          stepMarkers.push(marker);
+        });
+        populateRouteSteps(r);
+      }
+    });
+
+    if (allPoints.length) map.fitBounds(L.latLngBounds(allPoints).pad(0.2));
+    populateRouteList(data);
+  }
+
+  function populateRouteList(data) {
+    const container = document.getElementById("routesList");
+    container.innerHTML = "";
+    data.routes.forEach((r, idx) => {
+      const div = document.createElement("div");
+      div.className = "route-item" + (idx === 0 ? " optimal" : "");
+      div.innerHTML = `<b>Route ${r.id}</b> • ${r.distance} km • ${r.duration} mins ${idx === 0 ? "✅" : ""}`;
+      div.onclick = () => highlightRoute(idx);
+      container.appendChild(div);
+    });
+  }
+
+  function highlightRoute(index) {
+    polylines.forEach((p, i) => {
+      if (i === index) {
+        p.setStyle({ weight: 9, opacity: 1.0 });
+        map.fitBounds(p.getBounds().pad(0.15));
+        p.bringToFront();
+      } else {
+        p.setStyle({ weight: (i === 0 ? 7 : 4), opacity: 0.6 });
+      }
+    });
+  }
+
+  function populateRouteSteps(route) {
+    const container = document.getElementById("stepsList");
+    container.innerHTML = "";
+    route.steps.forEach((step, idx) => {
+      const div = document.createElement("div");
+      div.className = "step-item";
+      div.innerHTML = `<b>Step ${idx + 1}</b>: ${step.instruction} — ${Math.round(step.distance)} m`;
+      container.appendChild(div);
+    });
+  }
+
+  document.getElementById("findBtn").addEventListener("click", () => {
+    const start = document.getElementById("start").value,
+          end = document.getElementById("end").value,
+          mode = document.getElementById("mode").value;
+    fetch("/route", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ start, end, mode })
+    })
+    .then(r => r.json())
+    .then(data => {
+      if (data.error) {
+        alert(data.error);
+        return;
+      }
+      drawRoutes(data);
+    });
+  });
+
+  document.getElementById("locBtn").addEventListener("click", () => {
+    if (!navigator.geolocation) {
+      alert("Geolocation not supported");
+      return;
+    }
+    navigator.geolocation.getCurrentPosition(pos => {
+      document.getElementById("start").value = `${pos.coords.latitude},${pos.coords.longitude}`;
+    }, err => alert("Location error: " + err.message));
+  });
+</script>
+</body>
+</html>
